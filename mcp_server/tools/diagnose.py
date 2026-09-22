@@ -862,11 +862,13 @@ def _last_failed_task(limit: int = 30) -> dict[str, Any] | None:
 
 
 def _collect_logs(host_metadata: dict[str, Any]) -> dict[str, Any]:
-    root = env_utils.get_project_root()
-    stderr_log = os.path.join(root, "scratch", "mcp_stderr.log")
+    # Keep in sync with mcp_server/server.py: the scratch dir lives under the
+    # writable app dir, not the (possibly read-only) repository root.
+    scratch = env_utils.get_writable_dir("scratch")
+    stderr_log = os.path.join(scratch, "mcp_stderr.log")
     return {
         "mcp_stderr_log": stderr_log,
-        "mcp_launch_log": os.path.join(root, "scratch", "mcp_launch_debug.log"),
+        "mcp_launch_log": os.path.join(scratch, "mcp_launch_debug.log"),
         "daemon_log": (host_metadata.get("daemon") or {}).get("log_path"),
         "recent_mcp_errors": _tail_errors(stderr_log),
         "last_failed_task": _last_failed_task(),

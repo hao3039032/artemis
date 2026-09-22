@@ -17,7 +17,27 @@
 import os
 import subprocess
 import sys
+import tempfile
 from typing import Any
+
+
+def get_writable_dir(name: str) -> str:
+    """Returns a writable directory for runtime artifacts (logs, screenshots).
+
+    The repository root (get_project_root()) is read-only when the server is
+    bundled into an AppImage squashfs, so artifacts must never land next to
+    the code. Prefer the Artemis user app dir (ARTEMIS_APP_DIR-aware); fall
+    back to the system temp dir when the artemis config package is
+    unavailable.
+    """
+    try:
+        from artemis.config.paths import get_app_dir
+
+        base = os.path.join(str(get_app_dir()), name)
+    except Exception:
+        base = os.path.join(tempfile.gettempdir(), "artemis-mcp", name)
+    os.makedirs(base, exist_ok=True)
+    return base
 
 
 def get_project_root() -> str:

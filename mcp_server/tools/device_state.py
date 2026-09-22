@@ -61,8 +61,6 @@ async def mobile_get_device_state(view_type: str, device_serial: str | None = No
         latest_screenshot_b64 = device_data.base64
         xml_hierarchy = device_data.elements
 
-        project_root = env_utils.get_project_root()
-
         if view_type == "screenshot":
             screenshot_bytes = base64.b64decode(latest_screenshot_b64)
             device_id = controller.ctx.device.device_id
@@ -70,7 +68,10 @@ async def mobile_get_device_state(view_type: str, device_serial: str | None = No
                 [c if c.isalnum() or c in ("-", "_") else "_" for c in device_id]
             )
             screenshot_filename = f"live_screenshot_{safe_device_id}.jpg"
-            screenshot_path = os.path.join(project_root, screenshot_filename)
+            # The repo root is read-only inside the AppImage; keep artifacts in
+            # the writable app dir (falls back to the system temp dir).
+            screenshot_dir = env_utils.get_writable_dir("screenshots")
+            screenshot_path = os.path.join(screenshot_dir, screenshot_filename)
 
             with open(screenshot_path, "wb") as f:
                 f.write(screenshot_bytes)

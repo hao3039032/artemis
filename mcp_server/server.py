@@ -42,7 +42,12 @@ def _rotate_log(path: str, max_bytes: int = _LOG_MAX_BYTES) -> None:
 
 
 try:
-    _mcp_log_dir = os.path.join(PROJECT_ROOT, "scratch")
+    # mcp_server.utils.env_utils only pulls stdlib modules at import time, so
+    # this early import is safe. The scratch dir lives under the user app dir
+    # (or /tmp) because the bundled repo may be a read-only AppImage mount.
+    from mcp_server.utils import env_utils as _env_utils
+
+    _mcp_log_dir = _env_utils.get_writable_dir("scratch")
     os.makedirs(_mcp_log_dir, exist_ok=True)
 
     _launch_log = os.path.join(_mcp_log_dir, "mcp_launch_debug.log")
