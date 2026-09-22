@@ -603,10 +603,38 @@ class McpActionExecutor:
             x1, y1, x2, y2 = target
             recorded = self._require_description(args, "swipe")
 
+            # Mirror the driver's swipe_normalized math (including clamping)
+            # so the receipt reports the real device pixels that will be
+            # touched. Models frequently pass screenshot pixel coordinates
+            # into this normalized (0-1000) grid; echoing the converted result
+            # (and clamping warnings) lets them notice the landing point is
+            # far off and self-correct on the next attempt.
+            def _to_px(v: float, size: int) -> int:
+                return int(max(0, min(size - 1, round(v * size / 1000.0))))
+
+            def _range_note(*vals: float) -> str:
+                out_of_range = [v for v in vals if v < 0 or v > 1000]
+                if not out_of_range:
+                    return ""
+                return (
+                    f" WARNING: {out_of_range} outside the 0-1000 normalized"
+                    " range was clamped."
+                )
+
+            px1, py1 = _to_px(x1, width), _to_px(y1, height)
+            px2, py2 = _to_px(x2, width), _to_px(y2, height)
+
             def finalize(res: ActionResult) -> str:
                 if not res.ok:
                     return f"Error dragging: {res.detail}"
-                return f"Swiped from [{x1}, {y1}] to [{x2}, {y2}] (normalized)."
+                return (
+                    f"Swiped from [{x1}, {y1}] to [{x2}, {y2}] (normalized)"
+                    f" -> device pixels ({px1}, {py1}) -> ({px2}, {py2})"
+                    f" on a {width}x{height} screen.{_range_note(x1, y1, x2, y2)}"
+                    " Coordinates are on the 0-1000 normalized grid, not"
+                    " screenshot pixels; convert pixel coordinates first"
+                    " (pixel * 1000 / screen_size)."
+                )
 
             return (
                 "swipe",
