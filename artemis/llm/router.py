@@ -235,6 +235,16 @@ class ModelFactory:
                 or os.environ.get("GOOGLE_API_KEY")
                 or os.environ.get("GEMINI_API_KEY")
             )
+            # Custom Gemini-protocol gateway (e.g. a corporate relay proxying
+            # generativelanguage.googleapis.com): explicit endpoint override
+            # first, then the tray-managed env vars. Passed through to
+            # ChatGoogleGenerativeAI(base_url=...), which is a first-class
+            # field for exactly this gateway use case.
+            google_base_url = (
+                endpoint.api_base
+                or os.environ.get("GOOGLE_BASE_URL")
+                or os.environ.get("GEMINI_BASE_URL")
+            )
             # Gemini 1.x/2.x only understand thinking_budget.
             thinking_level = (
                 endpoint.thinking_level if supports_thinking_level(endpoint.model_name) else None
@@ -245,6 +255,7 @@ class ModelFactory:
                 "temperature": endpoint.temperature,
                 "max_output_tokens": endpoint.max_tokens,
                 "api_key": api_key,
+                "base_url": google_base_url,
                 "timeout": endpoint.timeout_seconds,
                 "thinking_budget": endpoint.thinking_budget,
                 "thinking_level": thinking_level,
