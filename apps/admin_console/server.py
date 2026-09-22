@@ -452,11 +452,38 @@ class ArtemisUvicornServer(uvicorn.Server):
         super().handle_exit(sig, frame)
 
 
-def run_ui_server(host: str, port: int, reload: bool = False) -> None:
+def run_ui_server(host: str, port: int, reload: bool = False, parent_pid: int | None = None) -> None:
     """Run the UI server with bounded, signal-aware graceful shutdown."""
     state.host = host
     state.port = port
     write_server_info(port=port, host=host, lifecycle_token=LIFECYCLE_TOKEN)
+
+    # MCP Tray addition: exit once the spawning process is gone. The
+    # auto-spawned daemon is setsid-detached (start_new_session=True), so it
+    # is reaped by init and otherwise outlives the MCP server that created
+    # it — leaving a zombie holding the port with stale PYTHONPATH / mount
+    # paths after the embedding app (e.g. a tray AppImage) exits.
+    if parent_pid:
+        import threading
+        import time
+
+        def _watch_parent() -> None:
+            while True:
+                time.sleep(2.0)
+                try:
+                    os.kill(parent_pid, 0)
+                except (ProcessLookupError, PermissionError):
+                    # Gone, or PID recycled to another user's process.
+                    state.is_shutting_down = True
+                    state.shutdown_event.set()
+                    server = getattr(app.state, "uvicorn_server", None)
+                    if server is not None:
+                        server.should_exit = True
+                    return
+
+        threading.Thread(
+            target=_watch_parent, name="parent-lifetime-watch", daemon=True
+        ).start()
 
     try:
         if reload:
@@ -500,8 +527,16 @@ def main(argv: list[str] | None = None) -> None:
         default=int(os.environ.get("ANTIGRAVITY_SIDECAR_WEB_PORT", "8000")),
         help="TCP port for the HTTP server.",
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=int(os.environ["ARTEMIS_DAEMON_PARENT_PID"])
+        if os.environ.get("ARTEMIS_DAEMON_PARENT_PID", "").isdigit()
+        else None,
+        help="MCP Tray addition: exit when this process is gone.",
+    )
     args = parser.parse_args(argv)
-    run_ui_server(host=args.host, port=args.port)
+    run_ui_server(host=args.host, port=args.port, parent_pid=args.parent_pid)
 
 
 if __name__ == "__main__":

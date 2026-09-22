@@ -109,6 +109,11 @@ def spawn_daemon(
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONUTF8"] = "1"
+    # MCP Tray addition: tie the daemon's lifetime to the spawning process
+    # (the MCP server). Without this the setsid-detached daemon is reaped by
+    # init and keeps the port with stale mount paths after the parent dies.
+    parent_pid = os.getpid()
+    env["ARTEMIS_DAEMON_PARENT_PID"] = str(parent_pid)
 
     cmd = [
         sys.executable,
@@ -118,6 +123,8 @@ def spawn_daemon(
         host,
         "--port",
         str(port),
+        "--parent-pid",
+        str(parent_pid),
     ]
 
     # Persist daemon output for post-mortem debugging (daemon mode is the
