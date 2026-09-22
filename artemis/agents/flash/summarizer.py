@@ -168,7 +168,11 @@ class VisualStepSummarizer(StepMemoryService):
             if model_name:
                 self._llm = get_google_llm(model_name=target_model, temperature=0.0)
             else:
-                self._llm = get_llm(ctx, name="summarizer", is_utils=True)
+                # "summarizer" is an agent node, not a utils node; the
+                # historical is_utils=True call always raised and fell into
+                # the Google fallback below, so an empty model name could
+                # never route through the configured summarizer node.
+                self._llm = get_llm(ctx, name="summarizer")
         except Exception:
             self._llm = get_google_llm(model_name=target_model, temperature=0.0)
         try:
