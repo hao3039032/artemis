@@ -26,6 +26,8 @@ from artemis.controllers.unified_controller import UnifiedMobileController
 from artemis.data_engine.trace import CURRENT_TRACE_ID, TraceSpan, trace
 from artemis.graph.state import State
 from artemis.graph.visibility import strict_state
+from artemis.llm.decision import DecisionError, choice_question, noul_question
+from artemis.services.decision import get_decision_client
 from artemis.services.llm import (
     acomplete,
     get_llm,
@@ -145,6 +147,45 @@ class ValidationResult(BaseModel):
     )
 
 
+# Concern labels the decision model picks between, mirroring the four
+# concrete concerns ValidationResult teaches the LLM judge.
+_DECISION_CONCERNS = [
+    "none",
+    "goal_drift",
+    "broken_loop_contract",
+    "weakened_checks",
+    "logical_dead_end",
+]
+
+
+def _decision_questions() -> dict:
+    return {
+        "is_approved": noul_question(
+            "Does the updated task plan still serve the initial goal and stay"
+            " coherent (no goal drift, broken loop contract, weakened check"
+            " standard, or logical dead end)?"
+        ),
+        "concern": choice_question(
+            "Which concern best applies to the plan change, if any?",
+            _DECISION_CONCERNS,
+        ),
+    }
+
+
+def _decision_feedback(p_approved: float, concern) -> str:
+    """Templated advisory feedback (Clef generates no free text)."""
+    if concern is not None and concern.chosen and concern.chosen != "none":
+        label = concern.chosen
+        p_concern = concern.confidence
+    else:
+        label = "inconsistency"
+        p_concern = 1.0 - p_approved
+    return (
+        f"Advisory (decision model): possible {label} (p={p_concern:.2f})."
+        " Review the plan change against the initial goal."
+    )
+
+
 async def run_async_planner_validation(
     ctx: ArtemisContext,
     initial_goal: str,
@@ -199,6 +240,46 @@ async def run_async_planner_validation(
             SystemMessage(content=system_message),
             HumanMessage(content=human_message),
         ]
+
+        # Decision-model path (Clef): the rendered review prompt is already a
+        # complete text state (goal, plan before/after, thinking, history), so
+        # it is reused verbatim. Advisory-only semantics are preserved either
+        # way: a flagged change is applied regardless, the Operator only sees
+        # the feedback. Any DecisionError falls back to the LLM judge below.
+        try:
+            client = get_decision_client(ctx)
+        except Exception as e:
+            logger.warning(f"Decision client unavailable for planner validation: {e}")
+            client = None
+        if client is not None and client.use_enabled("planner_validation"):
+            try:
+                decision = await client.decide(
+                    state=human_message,
+                    questions=_decision_questions(),
+                    decision_point="planner_validation",
+                )
+                # Missing answer defaults to approved (the advisory review
+                # never blocks a change on a technicality).
+                p_approved = decision.noul("is_approved")
+                if p_approved is None:
+                    p_approved = 1.0
+                if p_approved >= 0.5:
+                    logger.info(
+                        f"Planner validation (decision model): approved (p={p_approved:.2f})."
+                    )
+                    return {"status": "success", "feedback": ""}
+                concern = decision.choice("concern")
+                feedback = _decision_feedback(p_approved, concern)
+                logger.info(
+                    "Planner validation (decision model): NOT approved"
+                    f" (p={p_approved:.2f}): {feedback}"
+                )
+                return {"status": "failed", "feedback": feedback}
+            except DecisionError as e:
+                logger.warning(
+                    f"Decision-model planner validation failed ({e.kind});"
+                    f" falling back to the LLM judge: {e}"
+                )
 
         # Advisory review on the lightweight judge node (shared default with
         # the pixel safety net), never the heavyweight Planner model.

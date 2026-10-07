@@ -33,6 +33,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from artemis.agents.validator.categories import ValidationErrorCategory
 from artemis.context import ArtemisContext
 from artemis.graph.state import State
+from artemis.llm.decision import DecisionError, choice_question, noul_question
+from artemis.services.decision import get_decision_client
 from artemis.services.llm import acomplete_structured
 from artemis.utils import visualization
 from artemis.utils.logger import get_logger
@@ -103,6 +105,28 @@ def _describe_target(action_item: dict) -> str:
     return "\n".join(lines)
 
 
+def _operator_thinking_block(action_item: dict, state: State | None) -> str:
+    """The ``[Planned Action & Original Thinking]`` block, or "" when absent."""
+    if not state:
+        return ""
+    thoughts = []
+    native_thought = getattr(state, "operator_native_thinking", None)
+    if native_thought and native_thought.strip():
+        thoughts.append(native_thought.strip())
+    raw_thought = getattr(state, "operator_raw_thinking", None)
+    if raw_thought and raw_thought.strip():
+        thoughts.append(raw_thought.strip())
+
+    operator_thought = "\n\n".join(thoughts)
+    if not operator_thought.strip():
+        return ""
+    return (
+        "[Planned Action & Original Thinking]\n"
+        f"Action: {action_item.get('action')}\n"
+        f"Original Thinking:\n{operator_thought.strip()}"
+    )
+
+
 def _build_messages(
     prompt: str,
     orig_crop_bytes: bytes,
@@ -113,7 +137,6 @@ def _build_messages(
     """Formulates the multi-modal verification message pair."""
     orig_b64 = base64.b64encode(orig_crop_bytes).decode("utf-8")
     live_b64 = base64.b64encode(live_crop_bytes).decode("utf-8")
-    action_name = action_item.get("action")
 
     user_content = [
         {"type": "text", "text": _describe_target(action_item)},
@@ -128,23 +151,9 @@ def _build_messages(
             "image_url": {"url": f"data:image/jpeg;base64,{live_b64}"},
         },
     ]
-    if state:
-        thoughts = []
-        native_thought = getattr(state, "operator_native_thinking", None)
-        if native_thought and native_thought.strip():
-            thoughts.append(native_thought.strip())
-        raw_thought = getattr(state, "operator_raw_thinking", None)
-        if raw_thought and raw_thought.strip():
-            thoughts.append(raw_thought.strip())
-
-        operator_thought = "\n\n".join(thoughts)
-        if operator_thought.strip():
-            context_text = (
-                "[Planned Action & Original Thinking]\nAction:"
-                f" {action_name}\nOriginal"
-                f" Thinking:\n{operator_thought.strip()}"
-            )
-            user_content.append({"type": "text", "text": f"\n{context_text.strip()}"})
+    context_text = _operator_thinking_block(action_item, state)
+    if context_text:
+        user_content.append({"type": "text", "text": f"\n{context_text.strip()}"})
 
     return [
         SystemMessage(content=prompt),
@@ -152,62 +161,63 @@ def _build_messages(
     ]
 
 
-async def _run_attempt(
-    session,
-    llm,
-    prompt: str,
-    orig_crop_bytes: bytes,
-    current_coords,
-    action_item: dict,
-    state: State | None,
-    attempt: int,
-) -> tuple[bool, ValidationErrorCategory, str] | None:
-    """Runs one pixel validation attempt.
+# Situation labels the decision model picks between for a failed/changed
+# target. Advisory only: they never change the ValidationErrorCategory.
+_DECISION_SITUATIONS = [
+    "unchanged",
+    "shifted",
+    "covered",
+    "disappeared",
+    "surface_change",
+    "popup_blocked",
+]
 
-    Returns a final (passed, category, reason) verdict, or None when the
-    attempt yielded no verdict (never happens today: every branch is final).
-    Raises on infrastructure errors so the caller's retry loop can decide.
-    """
-    # A. Take fresh live screenshot (captures state changes / dynamic loading settling)
-    live_screenshot_b64 = None
-    try:
-        live_screenshot_b64 = await session.screenshot_b64()
-        success_img = True
-    except Exception:
-        success_img, live_screenshot_b64 = False, None
 
-    if not success_img or not live_screenshot_b64:
-        raise Exception("Failed to acquire live screenshot from controller/MCP tool.")
+def _decision_questions() -> dict:
+    """The pixel safety net's question set (noul + advisory situation)."""
+    return {
+        "is_present": noul_question(
+            "Is the action's intended target still present and interactive at"
+            " the red dot in Image 2?"
+        ),
+        "situation": choice_question(
+            "Which best describes the change at the red dot between Image 1"
+            " (reference) and Image 2 (current state)?",
+            _DECISION_SITUATIONS,
+        ),
+    }
 
-    # B. Decode and crop the live screen target
-    live_bytes = base64.b64decode(live_screenshot_b64)
-    live_crop_bytes = visualization.crop_and_annotate_target(
-        live_bytes, current_coords, crop_size=None, dot_radius=15
+
+def _decision_state(prompt: str, action_item: dict, state: State | None) -> str:
+    """Text state for the decision model: target block, thinking, rules."""
+    parts = [
+        "[Task]\nDecide whether the planned mobile action can still land on its intended target.",
+        _describe_target(action_item),
+    ]
+    thinking = _operator_thinking_block(action_item, state)
+    if thinking:
+        parts.append(thinking)
+    parts.append(f"[Judgment Rules]\n{prompt.strip()}")
+    parts.append(
+        "[Images]\nImage 1 (Reference): decision-time screenshot with the"
+        " target marked by a red dot.\nImage 2 (Current State): live"
+        " screenshot now, the same coordinates marked by a red dot."
     )
+    return "\n\n".join(parts)
 
-    # C. Formulate multi-modal verification message
-    messages = _build_messages(prompt, orig_crop_bytes, live_crop_bytes, action_item, state)
 
-    # D. Invoke Universal VLM. Parsing (fences, repair) and one
-    # corrective re-ask on unparseable JSON are handled by the
-    # structured-output layer; a StructuredOutputError lands in
-    # the attempt loop's except like any other attempt failure.
-    res_json = await acomplete_structured(llm, messages)
-    if not isinstance(res_json, dict):
-        raise ValueError(
-            "Pixel validation response parsed to"
-            f" {type(res_json).__name__}, expected a JSON object."
-        )
-    reasoning = res_json.get("reasoning", "")
-    is_present = res_json.get("is_present", True)
-    confidence = res_json.get("confidence", 1.0)
-
+def _apply_pixel_verdict(
+    is_present: bool,
+    confidence: float,
+    reasoning: str,
+    attempt: int,
+) -> tuple[bool, ValidationErrorCategory, str]:
+    """The safety net's outcome branches, shared by both judge paths."""
     logger.info(
         f"Pixel validation attempt {attempt}/{_MAX_ATTEMPTS} result:"
         f" is_present={is_present}, confidence={confidence:.2f}, reasoning={reasoning}"
     )
 
-    # E. Branching based on outcome
     if is_present:
         logger.info(f"Pixel validation SUCCESS on attempt {attempt}/{_MAX_ATTEMPTS}.")
         return True, ValidationErrorCategory.NONE, ""
@@ -233,6 +243,117 @@ async def _run_attempt(
         f"Pixel validation failed but confidence ({confidence:.2f}) is below 0.7. Bypassing check."
     )
     return True, ValidationErrorCategory.PIXEL_BYPASSED, ""
+
+
+async def _run_decision_attempt(
+    decision_client,
+    prompt: str,
+    orig_crop_bytes: bytes,
+    live_crop_bytes: bytes,
+    action_item: dict,
+    state: State | None,
+    attempt: int,
+) -> tuple[bool, ValidationErrorCategory, str]:
+    """One pixel validation attempt on the decision model.
+
+    Probability mapping: ``is_present = P(present) >= 0.5`` and the
+    confidence fed into the shared branches is the probability of the emitted
+    verdict (``P(present)`` when present, ``1 - P(present)`` when not), so the
+    calibrated probability directly replaces the VLM's self-reported
+    confidence. Raises :class:`DecisionError` so the caller can fall back to
+    the VLM path within the same attempt.
+    """
+    result = await decision_client.decide(
+        state=_decision_state(prompt, action_item, state),
+        questions=_decision_questions(),
+        images=[orig_crop_bytes, live_crop_bytes],
+        decision_point="pixel_safety_net",
+    )
+    p_present = result.noul("is_present", default=1.0)
+    is_present = p_present >= 0.5
+    confidence = p_present if is_present else (1.0 - p_present)
+    situation = result.choice("situation")
+    situation_label = situation.chosen if situation and situation.chosen else "unknown"
+    reasoning = f"decision model: situation={situation_label}, P(present)={p_present:.2f}"
+    return _apply_pixel_verdict(is_present, confidence, reasoning, attempt)
+
+
+async def _run_attempt(
+    session,
+    llm,
+    prompt: str,
+    orig_crop_bytes: bytes,
+    current_coords,
+    action_item: dict,
+    state: State | None,
+    attempt: int,
+    decision_client=None,
+) -> tuple[bool, ValidationErrorCategory, str] | None:
+    """Runs one pixel validation attempt.
+
+    Returns a final (passed, category, reason) verdict, or None when the
+    attempt yielded no verdict (never happens today: every branch is final).
+    Raises on infrastructure errors so the caller's retry loop can decide.
+
+    When a decision model is configured for this point, it replaces the VLM
+    for the attempt; a ``DecisionError`` falls back to the VLM path within
+    the same attempt (per-attempt fallback, no failure caching).
+    """
+    # A. Take fresh live screenshot (captures state changes / dynamic loading settling)
+    live_screenshot_b64 = None
+    try:
+        live_screenshot_b64 = await session.screenshot_b64()
+        success_img = True
+    except Exception:
+        success_img, live_screenshot_b64 = False, None
+
+    if not success_img or not live_screenshot_b64:
+        raise Exception("Failed to acquire live screenshot from controller/MCP tool.")
+
+    # B. Decode and crop the live screen target
+    live_bytes = base64.b64decode(live_screenshot_b64)
+    live_crop_bytes = visualization.crop_and_annotate_target(
+        live_bytes, current_coords, crop_size=None, dot_radius=15
+    )
+
+    # C'. Decision-model path (Clef): calibrated probabilities instead of a
+    # JSON-parsed VLM reply. Any failure falls through to the VLM attempt.
+    if decision_client is not None:
+        try:
+            return await _run_decision_attempt(
+                decision_client,
+                prompt,
+                orig_crop_bytes,
+                live_crop_bytes,
+                action_item,
+                state,
+                attempt,
+            )
+        except DecisionError as e:
+            logger.warning(
+                f"Decision-model pixel validation failed ({e.kind}); falling"
+                f" back to VLM on attempt {attempt}/{_MAX_ATTEMPTS}: {e}"
+            )
+
+    # C. Formulate multi-modal verification message
+    messages = _build_messages(prompt, orig_crop_bytes, live_crop_bytes, action_item, state)
+
+    # D. Invoke Universal VLM. Parsing (fences, repair) and one
+    # corrective re-ask on unparseable JSON are handled by the
+    # structured-output layer; a StructuredOutputError lands in
+    # the attempt loop's except like any other attempt failure.
+    res_json = await acomplete_structured(llm, messages)
+    if not isinstance(res_json, dict):
+        raise ValueError(
+            "Pixel validation response parsed to"
+            f" {type(res_json).__name__}, expected a JSON object."
+        )
+    reasoning = res_json.get("reasoning", "")
+    is_present = res_json.get("is_present", True)
+    confidence = res_json.get("confidence", 1.0)
+
+    # E. Branching based on outcome
+    return _apply_pixel_verdict(bool(is_present), float(confidence), str(reasoning), attempt)
 
 
 async def validate_action_precondition_pixel(
@@ -285,6 +406,17 @@ async def validate_action_precondition_pixel(
         logger.error(f"Failed to initialize LLM/prompt for pixel safety net: {e}. Bypassing check.")
         return True, ValidationErrorCategory.PIXEL_BYPASSED, ""
 
+    # 3b. Decision-model client (Clef) for this point, resolved once. None
+    # keeps the VLM path exactly as today.
+    decision_client = None
+    try:
+        client = get_decision_client(ctx)
+        if client is not None and client.use_enabled("pixel_safety_net"):
+            decision_client = client
+            logger.info("Pixel safety net: decision model active for this validation.")
+    except Exception as e:
+        logger.warning(f"Decision client unavailable for pixel safety net: {e}")
+
     # 4. Start high-precision execution validation retry loop
     last_error = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -299,6 +431,7 @@ async def validate_action_precondition_pixel(
                 action_item,
                 state,
                 attempt,
+                decision_client=decision_client,
             )
             if verdict is not None:
                 return verdict

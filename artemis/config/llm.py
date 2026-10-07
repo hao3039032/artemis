@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 import google.auth
 from google.auth.exceptions import DefaultCredentialsError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from artemis.config.constants import (
     LLM_CONFIG_FILENAME,
@@ -116,6 +116,127 @@ class LLMWithFallback(LLM):
         return f"{self.provider}/{self.model} (fallback: {self.fallback})"
 
 
+class DecisionModelUseConfig(BaseModel):
+    """Per-decision-point switches for the decision-model service.
+
+    Only meaningful while ``DecisionModelConfig.enabled`` is true; every gate
+    defaults to on so a single master switch turns the whole layer on."""
+
+    model_config = {"extra": "allow"}
+
+    pixel_safety_net: bool = Field(
+        default=True,
+        description=(
+            "Route the pre-action pixel safety net through the decision model"
+            " (image decision point: the endpoint must support the Clef"
+            " images[] extension)."
+        ),
+    )
+    planner_validation: bool = Field(
+        default=True,
+        description="Route the advisory planner-change review through the decision model.",
+    )
+    checker_verdict: bool = Field(
+        default=True,
+        description=(
+            "Route the Checker's final per-item verdicts through the decision"
+            " model (the evidence-gathering tool loop itself stays on the LLM)."
+        ),
+    )
+    stagnation_detection: bool = Field(
+        default=True,
+        description=(
+            "Enable the Flash stagnation advisor (dHash heuristic gate +"
+            " decision-model review, advisory notice only)."
+        ),
+    )
+
+
+class DecisionModelConfig(BaseModel):
+    """Configuration for the standalone decision-model service (Clef family).
+
+    Clef (Cloudflare, Apache 2.0) is a non-autoregressive scoring model: it
+    answers calibrated-probability questions (``noul`` boolean / ``choice``
+            option / ``score`` ordinal) over a text/JSON ``state`` plus up to
+    four embedded images, with median latencies far below a general VLM. This
+    config mounts it as an independent decision layer for Artemis's high-
+    frequency micro-decisions; every call site keeps its existing VLM/LLM path
+    as the fallback, so the default (``enabled: false``) reproduces today's
+    behavior byte-for-byte.
+    """
+
+    model_config = {"extra": "allow"}
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch. Disabled by default: no decision-model calls are made.",
+    )
+    provider: Literal["cloudflare", "custom"] = Field(
+        default="cloudflare",
+        description=(
+            "'cloudflare' uses Workers AI (account id + token from"
+            " CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_AUTH_TOKEN); 'custom' posts to"
+            " a self-hosted Jev/Clef-compatible endpoint given by base_url."
+        ),
+    )
+    model: str = Field(
+        default="clef-flash",
+        description=(
+            "Decision model name ('clef' 27B or 'clef-flash' 9B). Defaults to"
+            " clef-flash: the decision points are hot paths where latency wins."
+        ),
+    )
+    base_url: str | None = Field(
+        default=None,
+        description=(
+            "Full decision-endpoint URL for provider='custom' (Jev/Clef"
+            " compatible). Ignored for provider='cloudflare'."
+        ),
+    )
+    timeout: float = Field(
+        default=5.0,
+        gt=0,
+        description="Per-request timeout in seconds (one retry on timeout/5xx/429).",
+    )
+    use: DecisionModelUseConfig = Field(
+        default_factory=DecisionModelUseConfig,
+        description="Per-decision-point switches (all default to on).",
+    )
+
+    @model_validator(mode="after")
+    def _custom_provider_needs_base_url(self) -> "DecisionModelConfig":
+        if self.enabled and self.provider == "custom" and not (self.base_url or "").strip():
+            raise ValueError(
+                "decision_model.provider='custom' requires decision_model.base_url"
+                " (a Jev/Clef-compatible decision endpoint URL)."
+            )
+        return self
+
+    def validate_runtime(self) -> None:
+        """Check provider credentials that live in settings, not in the file.
+
+        Raises:
+            ValueError: when enabled with provider='cloudflare' but the
+                account id or auth token is missing from settings/.env.
+        """
+        if not self.enabled:
+            return
+        if self.provider == "cloudflare":
+            missing = [
+                name
+                for name, value in (
+                    ("CLOUDFLARE_ACCOUNT_ID", settings.CLOUDFLARE_ACCOUNT_ID),
+                    ("CLOUDFLARE_AUTH_TOKEN", settings.CLOUDFLARE_AUTH_TOKEN),
+                )
+                if not (value and str(value).strip())
+            ]
+            if missing:
+                raise ValueError(
+                    "decision_model is enabled with provider='cloudflare' but"
+                    f" {', '.join(missing)} is missing from settings/.env."
+                )
+
+
 def lightweight_judge_default() -> "LLMWithFallback":
     """Factory default for the lightweight judge nodes (pixel safety net and
     planner validation): a flash-lite model at temperature 0."""
@@ -162,6 +283,14 @@ class LLMConfig(BaseModel):
     validator_pixel_safety_net: LLMWithFallback | None = None
     planner_validation: LLMWithFallback | None = None
     output_analyzer: LLMWithFallback | None = None
+    decision_model: DecisionModelConfig = Field(
+        default_factory=DecisionModelConfig,
+        description=(
+            "Standalone decision-model service config (Clef family). Off by"
+            " default; parsed from the top-level 'decision_model' key of"
+            " artemis.jsonc / llm-config.json."
+        ),
+    )
 
     def validate_providers(self) -> None:
         """Validate credentials across all configured agent nodes."""
@@ -291,6 +420,11 @@ def _expand_default_into_nodes(config_dict: dict) -> dict:
                     util_cfg[k] = v
         utils_dict[util] = util_cfg
     result["utils"] = utils_dict
+
+    # Top-level non-node sections (e.g. the decision-model service config)
+    # must survive the expansion into the per-node schema.
+    if "decision_model" in config_dict:
+        result["decision_model"] = config_dict["decision_model"]
 
     return result
 

@@ -48,7 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from artemis.utils.video import detect_video_tools_enabled
 
 
-from artemis.config import ExplorerConfig, LLMConfig, OutputterConfig
+from artemis.config import DecisionModelConfig, ExplorerConfig, LLMConfig, OutputterConfig
 
 
 from artemis.utils.logger import get_logger
@@ -131,6 +131,9 @@ class ExecutionSetup(BaseModel):
     outputter: OutputterConfig = Field(default_factory=OutputterConfig)
     explorer: ExplorerConfig = Field(default_factory=ExplorerConfig)
     explorer_versions: dict[str, str] = Field(default_factory=dict)
+    decision_model: DecisionModelConfig | None = None
+    """Decision-model service (Clef) override for this task; None inherits
+    the file configuration via ctx.llm_config.decision_model."""
 
     @property
     def midway_checks_enabled(self) -> bool:
@@ -274,6 +277,18 @@ class ArtemisContext(BaseModel):
                 logger.debug(f"Action session close failed; skipped: {exc}", exc_info=True)
             finally:
                 self.action_session = None
+
+        # Close the pooled decision-model HTTP client (if this task resolved
+        # one) so its connection pool does not leak to GC in long-lived
+        # processes. Best-effort, same containment as the cleanup below.
+        decision_client = getattr(self, "decision_client", None)
+        if decision_client is not None and callable(getattr(decision_client, "aclose", None)):
+            try:
+                await decision_client.aclose()
+            except Exception as exc:
+                logger.debug(f"Decision client close failed; skipped: {exc}", exc_info=True)
+            finally:
+                self.decision_client = None
 
         # Drain in-flight step-summary jobs before the generic background-task
         # sweep: the shared service owns its own bounded flush semantics. On an

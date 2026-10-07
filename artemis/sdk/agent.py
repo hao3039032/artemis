@@ -1134,6 +1134,7 @@ class Agent:
             outputter=self._config.outputter,
             explorer=self._config.explorer,
             explorer_versions=self._config.explorer_versions,
+            decision_model=self._config.decision_model,
         )
 
         context.data_engine = DataEngine(ctx=context)

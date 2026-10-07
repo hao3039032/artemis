@@ -129,6 +129,40 @@
   },
 
   // ------------------------------------------------------------------------------
+  // 3.5 Decision Model Service (Clef) — off by default
+  // ------------------------------------------------------------------------------
+  // An independent decision layer for high-frequency micro-decisions: the
+  // pre-action pixel safety net, the advisory plan-change review, the
+  // Checker's final per-item verdicts, and the Flash stagnation advisor.
+  // Clef answers typed questions (boolean / choice / score) with calibrated
+  // probabilities instead of generated text, at a fraction of a VLM's
+  // latency. Every call site keeps its existing VLM/LLM path as the
+  // fallback, so "enabled": false (the default, or the section removed)
+  // reproduces a decision-model-free install exactly.
+  //
+  // Credentials for provider "cloudflare" come from the environment:
+  //   CLOUDFLARE_ACCOUNT_ID=...
+  //   CLOUDFLARE_AUTH_TOKEN=...   (Workers AI bearer token)
+  // provider "custom" posts to any Jev/Clef-compatible endpoint instead and
+  // needs "base_url" (the full decision-endpoint URL).
+  "decision_model": {
+    "enabled": false, // master switch (default off)
+    "provider": "cloudflare", // "cloudflare" | "custom"
+    "model": "clef-flash", // "clef" (27B) | "clef-flash" (9B, latency-first default)
+    "timeout": 5.0, // per-request seconds; one retry on timeout/5xx/429
+    "use": {
+      // Per-point switches (all default true while enabled). Image-bearing
+      // points (pixel_safety_net, stagnation_detection) additionally require
+      // the endpoint to support the Clef images[] extension.
+      "pixel_safety_net": true, // pre-action target check (images)
+      "planner_validation": true, // advisory plan-change review (text)
+      "checker_verdict": true, // Checker final per-item verdicts (text)
+      "stagnation_detection": true // Flash stagnation advisor (images)
+    }
+    // "base_url": null // required only for provider "custom"
+  },
+
+  // ------------------------------------------------------------------------------
   // 4. Runtime Mode & Agent Capabilities Configuration (Dual-Engine: Flash vs. Pro)
   // ------------------------------------------------------------------------------
   "agent": {

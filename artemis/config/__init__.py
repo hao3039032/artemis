@@ -60,6 +60,8 @@ from artemis.config.constants import (
     ENV_ANTHROPIC_API_KEY,
     ENV_ANTIGRAVITY_APP_DIR,
     ENV_ANTIGRAVITY_LS_ADDRESS,
+    ENV_CLOUDFLARE_ACCOUNT_ID,
+    ENV_CLOUDFLARE_AUTH_TOKEN,
     ENV_DATA_ENGINE_DB_PATH,
     ENV_EVENTS_OUTPUT_PATH,
     ENV_GCP_API_KEY,
@@ -101,6 +103,8 @@ from artemis.config.constants import (
 )
 from artemis.config.llm import (
     CyFunctionDetector,
+    DecisionModelConfig,
+    DecisionModelUseConfig,
     LLM,
     LLMConfig,
     LLMConfigUtils,
@@ -197,6 +201,8 @@ __all__ = [
     "is_frozen_bundle",
     # LLM Config & Models
     "CyFunctionDetector",
+    "DecisionModelConfig",
+    "DecisionModelUseConfig",
     "LLM",
     "LLMWithFallback",
     "LLMConfigUtils",
@@ -298,6 +304,8 @@ __all__ = [
     "ENV_ANTHROPIC_API_KEY",
     "ENV_OPEN_ROUTER_API_KEY",
     "ENV_XAI_API_KEY",
+    "ENV_CLOUDFLARE_ACCOUNT_ID",
+    "ENV_CLOUDFLARE_AUTH_TOKEN",
     "ENV_ARTEMIS_EXPLORER_VERSION",
     "ENV_ARTEMIS_DEFAULT_PROFILE",
     "ENV_ARTEMIS_DEFAULT_MODEL",

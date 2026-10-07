@@ -513,7 +513,7 @@ async def test_final_entry_persists_transcript_even_when_the_loop_fails(tmp_path
     raises or is superseded still leaves what it said."""
     ctx = _bus_ctx(tmp_path)
 
-    async def loop(ctx, messages, tools, items):
+    async def loop(ctx, messages, tools, items, final_subgoals=None):
         _stream(ctx, "turn-1", "Checking the final screen…")
         raise RuntimeError("provider down")
 

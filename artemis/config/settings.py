@@ -106,6 +106,10 @@ class Settings(BaseSettings):
     VISION_API_KEY: SecretStr | None = None
     API_KEY: SecretStr | None = None
 
+    # Cloudflare Workers AI (decision-model provider; see DecisionModelConfig)
+    CLOUDFLARE_ACCOUNT_ID: str | None = None
+    CLOUDFLARE_AUTH_TOKEN: SecretStr | None = None
+
     # Custom Provider Endpoints
     OPENAI_BASE_URL: str | None = None
 

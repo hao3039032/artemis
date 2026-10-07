@@ -31,6 +31,7 @@ from artemis.config import (
 )
 from artemis.context import DevicePlatform
 from artemis.sdk.constants import DEFAULT_PROFILE_NAME
+from artemis.config import DecisionModelConfig
 from artemis.sdk.types.agent import (
     AgentConfig,
     AgentProfile,
@@ -104,6 +105,7 @@ class AgentConfigBuilder:
         self._disable_outputter = not agent_cfg.outputter.enabled
         self._flash = agent_cfg.flash
         self._pro = agent_cfg.pro
+        self._decision_model: DecisionModelConfig | None = None
 
     def add_profile(self, profile: AgentProfile, validate: bool = True) -> "AgentConfigBuilder":
         """Add an agent profile to the ARTEMIS agent.
@@ -554,6 +556,43 @@ class AgentConfigBuilder:
         self._denylisted_tools = tools
         return self
 
+    def with_decision_model(
+        self,
+        config: DecisionModelConfig | None = None,
+        **overrides: Any,
+    ) -> "AgentConfigBuilder":
+        """Configure the standalone decision-model service (Clef family).
+
+        The config applies to every task started from this agent and takes
+        precedence over the file configuration (the top-level
+        ``decision_model`` key of artemis.jsonc). Without this call the file
+        configuration applies; with neither, the decision layer stays off.
+
+        Args:
+            config: A complete DecisionModelConfig (None keeps the current
+                value, or accepts the keyword overrides below).
+            **overrides: Field overrides on the current/existing config, e.g.
+                ``with_decision_model(enabled=True, model="clef")`` or
+                ``with_decision_model(use={"checker_verdict": False})``.
+        """
+        if config is None and not overrides:
+            # Nothing to apply: keep inheriting the file configuration (an
+            # explicit disabled config here would override an enabled file
+            # config through the execution_setup precedence).
+            return self
+
+        base = config if config is not None else (self._decision_model or DecisionModelConfig())
+        # Re-validate instead of model_copy: pydantic's model_copy(update=...)
+        # skips validation, so a dict ``use`` override would stay a plain dict
+        # (every use_enabled() lookup on it returns False) and the
+        # custom-needs-base_url validator would be bypassed.
+        data = base.model_dump()
+        if isinstance(overrides.get("use"), dict):
+            data["use"] = {**data.get("use", {}), **overrides.pop("use")}
+        data.update(overrides)
+        self._decision_model = DecisionModelConfig.model_validate(data)
+        return self
+
     def build(self, validate_profiles: bool = True) -> AgentConfig:
         """Build the ARTEMIS AgentConfig object.
 
@@ -629,6 +668,7 @@ class AgentConfigBuilder:
             flash=self._flash,
             pro=self._pro,
             explorer=self._explorer,
+            decision_model=self._decision_model,
             explorer_versions=self._explorer_versions,
             denylisted_tools=self._denylisted_tools,
             enable_video_ledger=self._enable_video_ledger,

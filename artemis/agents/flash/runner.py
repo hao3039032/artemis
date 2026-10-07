@@ -53,6 +53,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from artemis.agents.flash.stagnation import StagnationAdvisor, post_turn_snapshot
 from artemis.agents.flash.summarizer import VisualStepSummarizer, build_focus_context
 from artemis.agents.operator.prompts import REASONING_REMINDER, UserGuidance, render_user_guidance
 from artemis.agents.validator.tool_declarations import (
@@ -80,6 +81,7 @@ from artemis.llm.structured import ParseFailure, parse_structured
 from artemis.mcp.action_executor import McpActionExecutor
 from artemis.mcp.observation import observe
 from artemis.memory.transcript import PRO_UI_LIST_MARKER, TranscriptLedger, mark_ephemeral
+from artemis.services.decision import get_decision_client
 from artemis.services.llm import (
     RobustChatModelWrapper,
     acomplete,
@@ -115,10 +117,15 @@ class _TurnRecord:
     first keys the observation screenshot to its visual-transition summary,
     all of them feed the chunk ledger. ``actions`` collects the outcome of
     every device action so the turn's execution result can be rendered.
+    ``action_records`` keeps the (action_dict, status) pairs for the
+    stagnation advisor's repetition gate.
     """
 
     step_keys: list[str] = field(default_factory=list)
     actions: list[tuple[str, str, str]] = field(default_factory=list)
+    action_records: list[tuple[dict | None, str]] = field(default_factory=list)
+    stagnation_snapshot: object | None = None
+    """StagnationAdvisor window turn built once the turn's actions are done."""
 
     def result(self) -> dict | None:
         """The turn's execution result in the validator-report shape.
@@ -821,6 +828,7 @@ class FlashRunner:
             if name in action_names:
                 turn.step_keys.append(str(recorded_step_id) if recorded_step_id else str(tc_id))
                 turn.actions.append((name, exec_result.status, exec_result.text_summary))
+                turn.action_records.append((action_dict, exec_result.status))
 
             # ⚡ Non-blocking dispatch of objective visual transition summarizer
             if self.summarizer and name in action_names:
@@ -871,6 +879,8 @@ class FlashRunner:
             if name in action_names:
                 turn.step_keys.append(str(tc_id))
                 turn.actions.append((name, "error", f"Error executing tool {name}: {e}"))
+                # A failed action resets the stagnation repetition chain.
+                turn.action_records.append((None, "error"))
             messages.append(
                 ToolMessage(
                     tool_call_id=tc_id,
@@ -1057,6 +1067,19 @@ class FlashRunner:
         previous_turn: _TurnRecord | None = None
         pending_notices: list[str] = []
 
+        # Stagnation advisor (advisory-only; inert without a configured
+        # decision model, and its gate costs one dHash per turn at most).
+        stagnation_advisor = StagnationAdvisor()
+        try:
+            decision_client = get_decision_client(self.ctx)
+            if decision_client is not None and decision_client.use_enabled("stagnation_detection"):
+                logger.info("Flash stagnation advisor active for this run.")
+            else:
+                decision_client = None
+        except Exception as e:
+            logger.warning(f"Decision client unavailable for stagnation advisor: {e}")
+            decision_client = None
+
         while limit is None or turns < limit:
             turns += 1
             logger.info(f"--- Artemis Flash Turn {turns}{f'/{limit}' if limit else ''} ---")
@@ -1066,7 +1089,19 @@ class FlashRunner:
 
             # Commit the previous turn: its step ids and outcomes exist now.
             self._commit_turn(ledger, previous_turn)
+            # Stagnation advisor mount point (after _commit_turn, before the
+            # tail): feed the executed turn into the window, then maybe emit
+            # an advisory notice the upcoming tail carries to the model.
+            if previous_turn is not None:
+                stagnation_advisor.record_turn(previous_turn.stagnation_snapshot)  # type: ignore[arg-type]
             previous_turn = None
+            try:
+                stagnation_notice = await stagnation_advisor.review_and_notify(decision_client)
+            except Exception as e:  # advisory only: never disturb the loop
+                logger.debug(f"Stagnation advisor error (ignored): {e}")
+                stagnation_notice = None
+            if stagnation_notice:
+                pending_notices.append(stagnation_notice)
 
             # Check for real-time injected instructions: the verbatim text
             # is stamped on the step, the guidance pair goes to the tail.
@@ -1158,6 +1193,14 @@ class FlashRunner:
             )
             ledger.stage_turn(messages[turn_base:])
             previous_turn = turn
+            # Snapshot for the stagnation advisor once this turn's actions and
+            # their post screenshot are final — skipped entirely (zero cost)
+            # when no decision model is configured for the point.
+            if decision_client is not None:
+                turn.stagnation_snapshot = post_turn_snapshot(
+                    turn.action_records,  # type: ignore[arg-type]
+                    current_pre_screenshot_bytes,
+                )
             if final_report_from_calls is not None:
                 return final_report_from_calls
 

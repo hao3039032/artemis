@@ -49,6 +49,8 @@ from artemis.constants import CHECKER_MAX_ITERATIONS
 from artemis.context import ArtemisContext
 from artemis.data_engine.context_vars import CURRENT_TRACE_ID
 from artemis.data_engine.trace import trace, trace_langchain_tool
+from artemis.llm.decision import MAX_QUESTIONS, DecisionError, choice_question, noul_question
+from artemis.services.decision import get_decision_client
 from artemis.services.llm import acomplete, get_llm, invoke_llm_with_timeout_message
 from artemis.tools.history import get_history_tools
 from artemis.tools.scratchpad import get_read_note_tool_pure
@@ -429,6 +431,208 @@ async def _structured_report(llm, messages) -> CheckReport:
     return CheckReport(verdicts=[])
 
 
+# --- Decision-model final verdict (Clef) -----------------------------------------------
+
+#: Below this top probability a decision verdict degrades to inconclusive,
+#: mirroring _normalize_report's conservative downgrade of vague verdicts.
+_DECISION_MIN_VERDICT_PROBABILITY = 0.6
+
+#: Evidence excerpts are carried over from the conversation, capped per item.
+_DECISION_EVIDENCE_MAX_CHARS = 300
+
+#: Cap on the decision state assembled from the conversation text.
+_DECISION_STATE_MAX_CHARS = 24000
+
+#: Evidence placeholder returned when the conversation carries no tool
+#: output at all; a "failed" verdict resting on it alone is downgraded
+#: (same hygiene as _normalize_report's empty-evidence rule).
+_NO_EVIDENCE_PLACEHOLDER = "no probe output collected"
+
+
+def _message_text(message) -> str:
+    """Best-effort text content of one conversation message."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _conversation_evidence(messages: list) -> str:
+    """The conversation as text evidence for the decision model (tail-bounded)."""
+    lines = []
+    for message in messages:
+        text = _message_text(message).strip()
+        if not text:
+            continue
+        role = type(message).__name__.replace("Message", "") or "Message"
+        lines.append(f"[{role}]\n{text}")
+    evidence = "\n\n".join(lines)
+    if len(evidence) > _DECISION_STATE_MAX_CHARS:
+        evidence = "... [conversation truncated]\n" + evidence[-_DECISION_STATE_MAX_CHARS:]
+    return evidence
+
+
+def _item_evidence(item_text: str, messages: list) -> str:
+    """The last probe/tool output relevant to one check item (keyword match).
+
+    The evidence is carried over from the conversation the LLM loop already gathered —
+    the decision model generates no text of its own. Falls back to the last
+    tool output when no keyword matches.
+    """
+    tool_outputs: list[str] = []
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            text = _message_text(message).strip()
+            if text:
+                tool_outputs.append(text)
+    keywords = [
+        token.lower()
+        for token in re.split(r"[^A-Za-z0-9\u4e00-\u9fff]+", item_text)
+        if len(token) > 3
+    ]
+    for text in reversed(tool_outputs):
+        lowered = text.lower()
+        if any(keyword in lowered for keyword in keywords):
+            excerpt = text[:_DECISION_EVIDENCE_MAX_CHARS]
+            return excerpt + ("..." if len(text) > _DECISION_EVIDENCE_MAX_CHARS else "")
+    if tool_outputs:
+        text = tool_outputs[-1]
+        excerpt = text[:_DECISION_EVIDENCE_MAX_CHARS]
+        return excerpt + ("..." if len(text) > _DECISION_EVIDENCE_MAX_CHARS else "")
+    return _NO_EVIDENCE_PLACEHOLDER
+
+
+def _decision_verdict_questions(check_items: list, final_subgoals: list[str] | None = None) -> dict:
+    """One choice question per check item (id ``item_<i>``).
+
+    Final entry only: one extra noul question per completed top-level
+    subgoal (id ``subgoal_<i>``), mapped into ``unmet_subgoals`` — the
+    release gate at the graph layer reads that field in addition to the
+    verdicts, so the decision path must answer it too.
+    """
+    questions: dict = {}
+    for i, ci in enumerate(check_items):
+        questions[f"item_{i}"] = choice_question(
+            f"Check item (kind={ci.kind}, when={ci.when}): {ci.text}. Based on"
+            " the state and evidence, what is the verdict?",
+            ["passed", "failed", "inconclusive"],
+        )
+    for i, text in enumerate(final_subgoals or []):
+        questions[f"subgoal_{i}"] = noul_question(
+            "Given the evidence, is this completed plan subgoal's intent"
+            f" demonstrably unmet? Subgoal: '{text}'"
+        )
+    return questions
+
+
+def _decision_check_report(
+    result,
+    check_items: list,
+    messages: list,
+    final_subgoals: list[str] | None = None,
+) -> CheckReport:
+    """Maps one decision result onto a CheckReport (per item, conservative)."""
+    verdicts: list[CheckVerdict] = []
+    for i, ci in enumerate(check_items):
+        answer = result.choice(f"item_{i}")
+        status = "inconclusive"
+        if answer is not None and answer.chosen in ("passed", "failed", "inconclusive"):
+            status = (
+                answer.chosen
+                if answer.confidence >= _DECISION_MIN_VERDICT_PROBABILITY
+                else "inconclusive"
+            )
+        evidence = _item_evidence(ci.text, messages)
+        if status == "failed" and evidence == _NO_EVIDENCE_PLACEHOLDER:
+            # Same hygiene as _normalize_report: a failed verdict needs real
+            # carried-over evidence; the placeholder means none existed.
+            status = "inconclusive"
+            evidence = "failed verdict lacked concrete evidence; downgraded"
+        verdicts.append(
+            CheckVerdict(
+                item_text=ci.text,
+                kind=ci.kind,
+                status=status,  # type: ignore[arg-type]
+                evidence=evidence,
+            )
+        )
+    unmet_subgoals: list[str] = []
+    for i, text in enumerate(final_subgoals or []):
+        answer = result.answers.get(f"subgoal_{i}")
+        if answer is not None and (answer.probability or 0.0) >= _DECISION_MIN_VERDICT_PROBABILITY:
+            unmet_subgoals.append(text)
+    return CheckReport(verdicts=verdicts, unmet_subgoals=unmet_subgoals)
+
+
+async def _final_report(
+    llm,
+    messages: list,
+    check_items: list,
+    decision_client=None,
+    final_subgoals: list[str] | None = None,
+) -> CheckReport:
+    """The loop's report step: decision model when available, LLM otherwise.
+
+    The evidence-gathering tool loop itself is untouched — it needs a
+    generative LLM to decide which read-only probes to call. Only the final
+    per-item verdicts route through the decision model; a ``DecisionError``
+    falls back to the structured-output report within the same iteration.
+    ``final_subgoals`` (final entry only) adds the per-subgoal unmet questions
+    whose answers must feed ``unmet_subgoals`` — the graph's release gate
+    reads that field too, so the decision path cannot drop it.
+    """
+    if decision_client is not None and decision_client.use_enabled("checker_verdict"):
+        try:
+            subgoals = list(final_subgoals or [])
+            if len(check_items) + len(subgoals) > MAX_QUESTIONS:
+                raise DecisionError(
+                    f"{len(check_items)} check items plus {len(subgoals)} final"
+                    f" subgoals exceed the {MAX_QUESTIONS}-question decision"
+                    " limit",
+                    kind="protocol",
+                )
+            state = (
+                "You are the Checker. Decide each check item's verdict from the"
+                " collected evidence.\n\n# Check Items\n"
+                + _format_check_items(check_items)
+                + "\n\n# Collected Conversation Evidence\n"
+                + _conversation_evidence(messages)
+            )
+            if subgoals:
+                state += (
+                    "\n\n# Completed Plan Subgoals"
+                    "\nJudge each completed subgoal against the evidence.\n"
+                    + "\n".join(f"- {text}" for text in subgoals)
+                )
+            result = await decision_client.decide(
+                state=state,
+                questions=_decision_verdict_questions(check_items, subgoals),
+                decision_point="checker_verdict",
+            )
+            report = _decision_check_report(result, check_items, messages, subgoals)
+            logger.info(
+                f"Checker verdicts from decision model: {[v.status for v in report.verdicts]}"
+                f" (unmet subgoals: {len(report.unmet_subgoals)})"
+            )
+            return report
+        except Exception as e:
+            # Any decision-path failure (typed DecisionError included) falls
+            # back to the structured-output report in the same iteration; an
+            # unexpected client exception must never skip the fallback.
+            logger.warning(
+                f"Decision-model checker verdict failed"
+                f" ({getattr(e, 'kind', type(e).__name__)}); falling"
+                f" back to the structured report: {e}"
+            )
+    return await _structured_report(llm, messages)
+
+
 def _normalize_report(report: CheckReport, check_items: list) -> CheckReport:
     """Node-side hygiene: vague failed verdicts downgrade to inconclusive; every
     expected item gets a verdict (missing ones are inconclusive)."""
@@ -466,9 +670,21 @@ async def _run_check_loop(
     messages: list,
     tools: list[BaseTool],
     check_items: list,
+    final_subgoals: list[str] | None = None,
 ) -> CheckReport:
+    """The shared tool loop; ``final_subgoals`` is set by the final entry
+    only (its decision-path report must answer the unmet-subgoal questions
+    the release gate reads)."""
     llm = get_llm(ctx=ctx, name="checker")
     traced_tools = [trace_langchain_tool(t, ctx) for t in tools]
+
+    # Decision-model client for the final verdicts (None keeps the
+    # structured-output path exactly as today).
+    try:
+        decision_client = get_decision_client(ctx)
+    except Exception as e:
+        logger.warning(f"Decision client unavailable for checker verdicts: {e}")
+        decision_client = None
 
     max_iterations = (
         getattr(ctx.execution_setup, "checker_max_iterations", CHECKER_MAX_ITERATIONS)
@@ -486,14 +702,22 @@ async def _run_check_loop(
                     )
                 )
             )
-            report = await _structured_report(llm, messages)
+            report = await _final_report(
+                llm, messages, check_items, decision_client, final_subgoals
+            )
             break
 
         active_llm = llm.bind_tools(tools=traced_tools)
         response = await invoke_llm_with_timeout_message(acomplete(active_llm, messages))
 
         if not response.tool_calls:
-            report = await _structured_report(llm, messages + [response])
+            report = await _final_report(
+                llm,
+                messages + [response],
+                check_items,
+                decision_client,
+                final_subgoals,
+            )
             break
 
         messages.append(response)
@@ -850,9 +1074,21 @@ async def run_final_check(
         SystemMessage(content=system_content),
         HumanMessage(content=content),
     ]
+    # Final entry only: the completed top-level subgoals the decision path
+    # must judge (the LLM path infers them from the plan; Clef needs them as
+    # explicit questions whose answers feed the release gate's
+    # unmet_subgoals term).
+    final_subgoals: list[str] = []
+    if plan_text:
+        try:
+            from artemis.utils.plan_grammar import parse_plan
+
+            final_subgoals = [item.text for item in parse_plan(plan_text).top_level if item.is_done]
+        except Exception as e:
+            logger.warning(f"Could not parse final plan for subgoal questions: {e}")
     with CheckerStreamCapture(ctx) as capture:
         try:
-            return await _run_check_loop(ctx, messages, tools, items)
+            return await _run_check_loop(ctx, messages, tools, items, final_subgoals)
         finally:
             _persist_stream(
                 ctx, capture, attempt_id=attempt_id, phase="final", checkpoint_id="final"
