@@ -24,6 +24,7 @@ from artemis.config import DecisionModelConfig
 from artemis.llm.decision import (
     DecisionClient,
     _is_bounded_jpeg,
+    _to_cloudflare_question,
     DecisionError,
     FakeDecisionClient,
     MAX_IMAGES,
@@ -474,3 +475,106 @@ async def test_http_502_is_retryable():
         await client._http.aclose()
     assert calls["n"] == 2
     assert result.noul("is_present") == pytest.approx(0.5)
+
+
+def _cloudflare_client(**overrides) -> DecisionClient:
+    """A cloudflare-provider client with settings-shaped credentials stubbed."""
+    cfg = DecisionModelConfig(
+        enabled=True, provider="cloudflare", model="clef-flash", **overrides
+    )
+    return DecisionClient(cfg)
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_wire_format_translates_questions_and_answers(monkeypatch):
+    """The cloudflare provider speaks the Workers AI Clef schema, not Jev.
+
+    Request: question/options -> instructions/criteria (criteria as an object
+    for choice). Response: the {"result": {...}} envelope with noul/choice
+    probabilities in the Workers AI answer shape.
+    """
+    from pydantic import SecretStr
+
+    from artemis.config import settings as artemis_settings
+
+    monkeypatch.setattr(artemis_settings, "CLOUDFLARE_ACCOUNT_ID", "acct123", raising=False)
+    monkeypatch.setattr(
+        artemis_settings, "CLOUDFLARE_AUTH_TOKEN", SecretStr("tok"), raising=False
+    )
+    responses = [
+        httpx.Response(
+            200,
+            json={
+                "success": True,
+                "result": {
+                    "model": "clef-flash",
+                    "answers": {
+                        "is_present": {"type": "noul", "noul": 0.9551},
+                        "situation": {
+                            "type": "choice",
+                            "choice": "shifted",
+                            "probabilities": {
+                                "unchanged": 0.0506,
+                                "shifted": 0.9354,
+                                "disappeared": 0.014,
+                            },
+                            "confidence": 0.8165,
+                        },
+                    },
+                    "usage": {"input_tokens": 346, "output_tokens": 0},
+                },
+            },
+        )
+    ]
+    handler, requests = _handler(responses)
+    client = _cloudflare_client()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await client.decide("the state", _QUESTIONS, decision_point="test")
+    finally:
+        await client._http.aclose()
+
+    import json
+
+    payload = json.loads(requests[0].read())
+    # Request translation: Jev question/options -> Clef instructions/criteria.
+    assert payload["model"] == "clef-flash"
+    assert payload["questions"]["is_present"] == {
+        "type": "noul",
+        "instructions": "Is it present?",
+    }
+    assert payload["questions"]["situation"]["criteria"] == {
+        "unchanged": "unchanged",
+        "shifted": "shifted",
+        "disappeared": "disappeared",
+    }
+    assert "question" not in payload["questions"]["situation"]
+    assert "options" not in payload["questions"]["situation"]
+    # URL carries the @cf/cloudflare/ prefix and bearer auth.
+    assert requests[0].url.path.endswith("/ai/run/@cf/cloudflare/clef-flash")
+    assert requests[0].headers["authorization"] == "Bearer tok"
+    # Response parsing: noul key + probabilities distribution.
+    assert result.noul("is_present") == pytest.approx(0.9551)
+    verdict = result.choice("situation")
+    assert verdict.chosen == "shifted"
+    assert verdict.distribution["shifted"] == pytest.approx(0.9354)
+    assert verdict.confidence == pytest.approx(0.9354)
+    assert result.usage == {"input_tokens": 346, "output_tokens": 0}
+
+
+def test_cloudflare_score_question_maps_numeric_scale(monkeypatch):
+    """score questions send low..high criteria labels; legend answers are lifted."""
+    spec = score_question("How good?", 1, 5)
+    translated = _to_cloudflare_question(spec)
+    assert translated["criteria"] == ["1", "2", "3", "4", "5"]
+    # Workers AI shape (weighted 0-based index + legend) -> lifted onto 1..5.
+    answers = parse_decision_answers(
+        {"quality": spec},
+        {"answers": {"quality": {"score": 3.72, "legend": {"0": "1", "1": "2"}}}},
+    )
+    assert answers["quality"].score == pytest.approx(4.72)
+    # Bare Jev shape answers the scale value directly.
+    answers_jev = parse_decision_answers(
+        {"quality": spec}, {"answers": {"quality": {"score": 4}}}
+    )
+    assert answers_jev["quality"].score == pytest.approx(4.0)

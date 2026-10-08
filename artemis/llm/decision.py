@@ -141,6 +141,41 @@ def score_question(question: str, low: int = 1, high: int = 10) -> dict[str, Any
     return {"type": "score", "question": question, "low": low, "high": high}
 
 
+def _to_cloudflare_question(spec: dict[str, Any]) -> dict[str, Any]:
+    """Translates one Jev question spec to the Workers AI Clef wire format.
+
+    Workers AI Clef (``@cf/cloudflare/clef*``) validates its input against a
+    strict schema: the prompt field is ``instructions`` (not ``question``)
+    and the option field is ``criteria`` — an object (option -> description)
+    for ``choice`` questions and an array of scale labels for ``score``.
+    Unknown keys such as ``question``/``options``/``low``/``high`` fail the
+    whole request with ``5006/5012 Bad input``.
+    """
+    kind = str((spec or {}).get("type") or "noul")
+    out: dict[str, Any] = {"type": kind}
+    prompt = spec.get("question")
+    if isinstance(prompt, str) and prompt.strip():
+        out["instructions"] = prompt
+    if kind == "choice":
+        options = spec.get("options")
+        if isinstance(options, (list, tuple)) and options:
+            # Identity map keeps the response probabilities keyed by exactly
+            # the option strings the caller knows about.
+            out["criteria"] = {str(o): str(o) for o in options}
+        elif isinstance(spec.get("criteria"), dict):
+            out["criteria"] = spec["criteria"]
+    elif kind == "score":
+        if isinstance(spec.get("criteria"), list):
+            out["criteria"] = [str(c) for c in spec["criteria"]]
+        else:
+            low = spec.get("low") if isinstance(spec.get("low"), int) else 1
+            high = spec.get("high") if isinstance(spec.get("high"), int) else 10
+            if high < low:
+                low, high = high, low
+            out["criteria"] = [str(v) for v in range(low, high + 1)]
+    return out
+
+
 # --- Image normalization -------------------------------------------------------------
 
 
@@ -271,7 +306,7 @@ def parse_decision_answers(questions: dict[str, Any], payload: Any) -> dict[str,
         elif kind == "choice":
             answers[qid] = _parse_choice(qid, spec, raw)
         elif kind == "score":
-            answers[qid] = _parse_score(qid, raw)
+            answers[qid] = _parse_score(qid, raw, spec)
         else:
             raise DecisionError(f"unsupported question type '{kind}'", kind="protocol")
 
@@ -284,7 +319,7 @@ def parse_decision_answers(questions: dict[str, Any], payload: Any) -> dict[str,
 
 
 def _parse_noul(qid: str, raw: dict[str, Any]) -> DecisionAnswer:
-    for key in ("p", "probability", "yes", "confidence"):
+    for key in ("p", "probability", "yes", "noul", "confidence"):
         p = _as_float(raw.get(key))
         if p is not None:
             return DecisionAnswer(question_id=qid, kind="noul", probability=p)
@@ -301,20 +336,25 @@ def _parse_noul(qid: str, raw: dict[str, Any]) -> DecisionAnswer:
 
 
 def _parse_choice(qid: str, spec: dict[str, Any], raw: dict[str, Any]) -> DecisionAnswer:
+    criteria = spec.get("criteria") if isinstance(spec.get("criteria"), dict) else None
     options = [str(o) for o in (spec or {}).get("options") or []]
-    # Shape 1: an explicit option -> probability distribution.
-    dist_raw = raw.get("p") if isinstance(raw.get("p"), dict) else raw.get("distribution")
-    if isinstance(dist_raw, dict) and dist_raw:
-        distribution = {}
-        for option, prob in dist_raw.items():
-            p = _as_float(prob)
-            if p is not None and (not options or str(option) in options):
-                distribution[str(option)] = p
-        if distribution:
-            chosen = max(distribution, key=distribution.get)  # type: ignore[arg-type]
-            return DecisionAnswer(
-                question_id=qid, kind="choice", chosen=chosen, distribution=distribution
-            )
+    if criteria:
+        options = options or [str(k) for k in criteria]
+    # Shape 1: an explicit option -> probability distribution. Cloudflare
+    # Workers AI returns the full distribution under "probabilities".
+    for dist_key in ("p", "distribution", "probabilities"):
+        dist_raw = raw.get(dist_key)
+        if isinstance(dist_raw, dict) and dist_raw:
+            distribution = {}
+            for option, prob in dist_raw.items():
+                p = _as_float(prob)
+                if p is not None and (not options or str(option) in options):
+                    distribution[str(option)] = p
+            if distribution:
+                chosen = max(distribution, key=distribution.get)  # type: ignore[arg-type]
+                return DecisionAnswer(
+                    question_id=qid, kind="choice", chosen=chosen, distribution=distribution
+                )
     # Shape 2: a chosen option (with optional probability).
     chosen_raw = None
     for key in ("choice", "option", "answer", "value"):
@@ -338,13 +378,22 @@ def _parse_choice(qid: str, spec: dict[str, Any], raw: dict[str, Any]) -> Decisi
     raise DecisionError(f"unparseable choice answer for '{qid}': {raw}", kind="protocol")
 
 
-def _parse_score(qid: str, raw: dict[str, Any]) -> DecisionAnswer:
+def _parse_score(qid: str, raw: dict[str, Any], spec: dict[str, Any] | None = None) -> DecisionAnswer:
     for key in ("score", "value", "answer"):
         v = raw.get(key)
         if isinstance(v, bool):
             continue
         if isinstance(v, (int, float)):
-            return DecisionAnswer(question_id=qid, kind="score", score=float(v))
+            score = float(v)
+            # A "legend" (0-based index -> label map) marks the Workers AI
+            # score shape: the value is a weighted criteria index, so lift it
+            # back onto a numeric [low, high] scale when the spec has one.
+            # Bare Jev endpoints answer the scale value directly — no offset.
+            low = (spec or {}).get("low")
+            has_legend = isinstance(raw.get("legend"), dict)
+            if has_legend and isinstance(low, (int, float)) and not isinstance(low, bool):
+                score += float(low)
+            return DecisionAnswer(question_id=qid, kind="score", score=score)
     raise DecisionError(f"unparseable score answer for '{qid}': {raw}", kind="protocol")
 
 
@@ -430,7 +479,11 @@ class DecisionClient:
         body: dict[str, Any] = {
             "model": self.config.model,
             "state": state,
-            "questions": questions,
+            "questions": (
+                {qid: _to_cloudflare_question(spec) for qid, spec in questions.items()}
+                if self.config.provider == "cloudflare"
+                else questions
+            ),
         }
         if images:
             body["images"] = normalize_images(images)
