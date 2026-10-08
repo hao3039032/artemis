@@ -72,6 +72,7 @@ def test_factory_jsonc_section_parses():
     cfg = DecisionModelConfig.model_validate(data["decision_model"])
     assert cfg.enabled is False  # factory default keeps behavior identical
     assert cfg.use.pixel_safety_net and cfg.use.stagnation_detection
+    assert cfg.use.agent_tool is True
 
 
 def _minimal_unified_config() -> dict:

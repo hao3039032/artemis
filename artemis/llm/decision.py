@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,6 +60,15 @@ _MAX_REQUEST_BYTES = 13 * 1024 * 1024
 
 #: Clef answers at most 64 questions per request.
 MAX_QUESTIONS = 64
+
+#: The agent-facing ``ask_decision`` tool accepts far fewer questions than
+#: the endpoint: each one costs latency on a hot decision path, and an agent
+#: that needs dozens should be reasoning itself instead.
+MAX_AGENT_QUESTIONS = 8
+
+#: Valid ``ask_decision`` question ids: stable answer keys the agent matches
+#: its own questions by.
+_AGENT_QUESTION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 _CLOUDFLARE_BASE = "https://api.cloudflare.com/client/v4/accounts"
 
@@ -139,6 +149,89 @@ def choice_question(question: str, options: list[str]) -> dict[str, Any]:
 def score_question(question: str, low: int = 1, high: int = 10) -> dict[str, Any]:
     """An ordinal question on the [low, high] scale."""
     return {"type": "score", "question": question, "low": low, "high": high}
+
+
+def ask_decision_questions(raw: Any) -> dict[str, dict[str, Any]]:
+    """Normalizes an agent-authored question list into the internal question dict.
+
+    The ``ask_decision`` agent tool receives a flat ``[{id, type, question,
+    ...}, ...]`` list; this validates and translates it into the ``{id: spec}``
+    dict :meth:`DecisionClient.decide` takes (reusing the ``noul``/``choice``/
+    ``score`` builders). Validation is strict so a malformed call surfaces as
+    an actionable error text instead of a cryptic endpoint rejection:
+
+    - 1..:data:`MAX_AGENT_QUESTIONS` dict items;
+    - ``id`` matches ``[A-Za-z0-9_.-]{1,64}`` and is unique;
+    - ``type`` is ``bool`` | ``choice`` | ``score`` with non-empty ``question``;
+    - ``choice``: 2-6 non-empty string options;
+    - ``score``: integer bounds with ``0 <= low < high <= 20``.
+
+    Raises:
+        DecisionError: kind ``protocol`` on the first violation found.
+    """
+    if not isinstance(raw, (list, tuple)) or not 1 <= len(raw) <= MAX_AGENT_QUESTIONS:
+        raise DecisionError(
+            f"questions must be a list of 1-{MAX_AGENT_QUESTIONS} question objects",
+            kind="protocol",
+        )
+    questions: dict[str, dict[str, Any]] = {}
+    for position, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise DecisionError(
+                f"question {position} must be an object with id/type/question",
+                kind="protocol",
+            )
+        qid = item.get("id")
+        if not isinstance(qid, str) or not _AGENT_QUESTION_ID_RE.match(qid):
+            raise DecisionError(
+                f"question {position} has invalid id {qid!r} (expected [A-Za-z0-9_.-], 1-64 chars)",
+                kind="protocol",
+            )
+        if qid in questions:
+            raise DecisionError(f"duplicate question id {qid!r}", kind="protocol")
+        text = item.get("question")
+        if not isinstance(text, str) or not text.strip():
+            raise DecisionError(
+                f"question {qid!r} needs non-empty 'question' text", kind="protocol"
+            )
+        qtype = item.get("type")
+        if qtype == "bool":
+            questions[qid] = noul_question(text)
+        elif qtype == "choice":
+            options = item.get("options")
+            if (
+                not isinstance(options, (list, tuple))
+                or not 2 <= len(options) <= 6
+                or not all(isinstance(o, str) and o.strip() for o in options)
+            ):
+                raise DecisionError(
+                    f"choice question {qid!r} needs 2-6 non-empty string options",
+                    kind="protocol",
+                )
+            questions[qid] = choice_question(text, [str(o).strip() for o in options])
+        elif qtype == "score":
+            low = item.get("low", 1)
+            high = item.get("high", 5)
+            if (
+                isinstance(low, bool)
+                or isinstance(high, bool)
+                or not isinstance(low, int)
+                or not isinstance(high, int)
+                or not 0 <= low < high <= 20
+            ):
+                raise DecisionError(
+                    f"score question {qid!r} needs integer bounds 0 <= low < high <= 20"
+                    f" (got low={low!r}, high={high!r})",
+                    kind="protocol",
+                )
+            questions[qid] = score_question(text, low, high)
+        else:
+            raise DecisionError(
+                f"question {qid!r} has unsupported type {qtype!r}"
+                " (use 'bool', 'choice' or 'score')",
+                kind="protocol",
+            )
+    return questions
 
 
 def _to_cloudflare_question(spec: dict[str, Any]) -> dict[str, Any]:
@@ -378,7 +471,9 @@ def _parse_choice(qid: str, spec: dict[str, Any], raw: dict[str, Any]) -> Decisi
     raise DecisionError(f"unparseable choice answer for '{qid}': {raw}", kind="protocol")
 
 
-def _parse_score(qid: str, raw: dict[str, Any], spec: dict[str, Any] | None = None) -> DecisionAnswer:
+def _parse_score(
+    qid: str, raw: dict[str, Any], spec: dict[str, Any] | None = None
+) -> DecisionAnswer:
     for key in ("score", "value", "answer"):
         v = raw.get(key)
         if isinstance(v, bool):

@@ -57,6 +57,7 @@ from artemis.agents.flash.stagnation import StagnationAdvisor, post_turn_snapsho
 from artemis.agents.flash.summarizer import VisualStepSummarizer, build_focus_context
 from artemis.agents.operator.prompts import REASONING_REMINDER, UserGuidance, render_user_guidance
 from artemis.agents.validator.tool_declarations import (
+    ASK_DECISION_TOOL,
     ASK_EXPLORER_TOOL,
     CLICK_SEQUENCE_TOOL,
     LIST_NOTES_TOOL,
@@ -89,6 +90,7 @@ from artemis.services.llm import (
     get_llm,
     invoke_llm_with_timeout_message,
 )
+from artemis.tools.decision_tool import ask_decision_available
 from artemis.tools.history import history_tool_declarations
 from artemis.tools.tool_wrapper import tool_result_messages
 from artemis.utils.coordinates import (
@@ -210,6 +212,11 @@ class FlashRunner:
         ]
         tools.insert(1, CLICK_SEQUENCE_TOOL)
         tools.append(ASK_EXPLORER_TOOL)
+        # The decision layer is opt-in (decision_model.enabled); without it
+        # the agent never sees the tool, and the prompt segment follows the
+        # same gate (its name is in available_tools or it is not).
+        if ask_decision_available(self.ctx):
+            tools.append(ASK_DECISION_TOOL)
         # Helper tools shared with the Pro operator: the history tools are
         # declared from the very same args schemas the LangChain tools bind
         # (same availability gates: a DataEngine session, recall config).

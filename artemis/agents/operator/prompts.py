@@ -31,6 +31,7 @@ from artemis.tools.command_tool import (
     _format_long_output_response,
     _is_output_long,
 )
+from artemis.tools.decision_tool import ask_decision_available
 from artemis.utils.plan_grammar import parse_plan, render_plan_grammar_spec
 from artemis.utils.task_tree import SELF_DESCRIBED_MARKER, action_intent_phrase
 from third_party.mobile_use.utils.logger import get_logger
@@ -95,9 +96,11 @@ _TURN_ENDING_ORDER = (
 OPERATOR_MAX_TOOL_ITERATIONS = 20
 
 #: Every tool name the operator prompt slots can reference. ``available_tools=None``
-#: resolves to this set, preserving the historical output.
+#: resolves to this set, producing the prompt as it renders with every known tool
+#: present (``ask_decision`` rides the decision layer, so it is dropped again by
+#: :func:`resolve_operator_prompt_tools` unless that layer is actually enabled).
 OPERATOR_PROMPT_TOOLSET: frozenset[str] = frozenset(
-    _PRE_DECISION_ALL_TOOLS + _PHYSICAL_ACTIONS_ORDER
+    _PRE_DECISION_ALL_TOOLS + _PHYSICAL_ACTIONS_ORDER + ("ask_decision",)
 )
 
 #: Renders the availability slots in operator.json. Square-bracket delimiters keep
@@ -206,6 +209,11 @@ def resolve_operator_prompt_tools(ctx: ArtemisContext) -> frozenset[str]:
     setup = getattr(ctx, "execution_setup", None)
     if not (setup and getattr(setup, "video_recording_tools_enabled", False)):
         available.discard("video_analyzer")
+
+    # ask_decision rides the decision-model layer (off by default); the
+    # prompt advertises it only while the wrapper actually binds the tool.
+    if not ask_decision_available(ctx):
+        available.discard("ask_decision")
 
     # The history tools need a DataEngine to read, and search_history is also
     # config-gated; the prompt must not advertise a tool that is not bound.

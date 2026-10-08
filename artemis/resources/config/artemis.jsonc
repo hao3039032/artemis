@@ -152,12 +152,13 @@
     "timeout": 5.0, // per-request seconds; one retry on timeout/5xx/429
     "use": {
       // Per-point switches (all default true while enabled). Image-bearing
-      // points (pixel_safety_net, stagnation_detection) additionally require
-      // the endpoint to support the Clef images[] extension.
+      // points (pixel_safety_net, stagnation_detection, agent_tool) additionally
+      // require the endpoint to support the Clef images[] extension.
       "pixel_safety_net": true, // pre-action target check (images)
       "planner_validation": true, // advisory plan-change review (text)
       "checker_verdict": true, // Checker final per-item verdicts (text)
-      "stagnation_detection": true // Flash stagnation advisor (images)
+      "stagnation_detection": true, // Flash stagnation advisor (images)
+      "agent_tool": true // expose the ask_decision agent tool (images; Flash + Pro Operator)
     }
     // "base_url": null // required only for provider "custom"
   },

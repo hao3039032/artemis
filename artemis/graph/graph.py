@@ -67,6 +67,7 @@ from artemis.tools.command_tool import (
     manage_task_wrapper,
     run_adb_command_wrapper,
 )
+from artemis.tools.decision_tool import ask_decision_wrapper
 from artemis.tools.diagnostic_tool import ask_diagnoser_wrapper
 from artemis.tools.explorer_tool import ask_explorer_wrapper
 from artemis.tools.index import get_tools_from_wrappers
@@ -983,6 +984,10 @@ async def get_graph(ctx: ArtemisContext) -> CompiledStateGraph:
         manage_task_wrapper,
         ask_explorer_wrapper,
         *HISTORY_TOOL_WRAPPERS,
+        # Bound only while the decision layer is enabled and use.agent_tool is
+        # on (the wrapper's is_available_fn gates it; the prompt teaching
+        # follows the same gate).
+        ask_decision_wrapper,
     ]
     # ask_committee does not follow the Operator's pre-decision / turn-ending contract.
 

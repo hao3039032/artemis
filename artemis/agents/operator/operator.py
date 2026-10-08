@@ -69,6 +69,7 @@ DEFERRING_TOOLS = {
     "manage_task",
     "analyze_task_output",
     "ask_explorer",
+    "ask_decision",
 }
 
 # Bare key names press_key accepts (case-insensitive, optional KEYCODE_ prefix).

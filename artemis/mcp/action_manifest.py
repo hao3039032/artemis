@@ -120,6 +120,7 @@ BACKEND_INDEPENDENT_TOOLS: frozenset[str] = frozenset(
         "ask_explorer",
         "ask_diagnoser",
         "ask_committee",
+        "ask_decision",
         "video_analyzer",
         "run_adb_command",
         "manage_task",

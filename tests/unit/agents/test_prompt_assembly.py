@@ -88,7 +88,7 @@ def test_full_toolset_is_the_default():
 @pytest.mark.parametrize(
     "tool",
     OPERATOR_DEVICE_TOOLS
-    + ("video_analyzer", "search_history", "replay_steps", "get_step_screenshot"),
+    + ("video_analyzer", "search_history", "replay_steps", "get_step_screenshot", "ask_decision"),
 )
 def test_removed_tool_leaves_no_reference(tool):
     """The executable definition of 'an absent tool costs the model nothing'."""

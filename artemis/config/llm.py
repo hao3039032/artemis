@@ -93,6 +93,14 @@ class DecisionModelUseConfig(BaseModel):
             " decision-model review, advisory notice only)."
         ),
     )
+    agent_tool: bool = Field(
+        default=True,
+        description=(
+            "Expose the 'ask_decision' agent tool (Flash runner and Pro"
+            " Operator): calibrated second-opinion questions answered by the"
+            " decision model with the current screenshot attached."
+        ),
+    )
 
 
 class DecisionModelConfig(BaseModel):

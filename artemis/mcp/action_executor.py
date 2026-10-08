@@ -71,7 +71,8 @@ __all__ = ["McpActionExecutor"]
 
 #: Non-device tools executed agent-side (never behind the action server).
 AGENT_TOOL_NAMES: frozenset[str] = (
-    frozenset({"read_note", "list_notes", "ask_explorer", "video_analyzer"}) | HISTORY_TOOL_NAMES
+    frozenset({"read_note", "list_notes", "ask_explorer", "ask_decision", "video_analyzer"})
+    | HISTORY_TOOL_NAMES
 )
 
 #: Actions whose ``target`` is a single point: an element index or an [x, y] pair.
@@ -677,6 +678,8 @@ class McpActionExecutor:
                 )
             elif raw_name in HISTORY_TOOL_NAMES:
                 text, blocks = await self._history_tool(raw_name, args)
+            elif raw_name == "ask_decision":
+                text = await self._ask_decision(args, state)
             else:
                 text, ok = await self._ask_explorer(
                     # ``task_description`` is the pre-contract argument name
@@ -762,6 +765,19 @@ class McpActionExecutor:
         if status in ("failed", "error"):
             return f"Video analysis failed: {outcome}", False
         return outcome, True
+
+    async def _ask_decision(self, args: dict[str, Any], state: Any) -> str:
+        """Runs the calibrated second-opinion tool for this agent.
+
+        The screenshot is the current turn's pre-action screen (the same
+        ``state.latest_screenshot`` ask_explorer resolves against), attached
+        only while the call asks for it — never more than one image.
+        """
+        from artemis.tools.decision_tool import run_ask_decision, state_screenshot_bytes
+
+        include = bool(args.get("include_screenshot", True))
+        screenshot = state_screenshot_bytes(state) if include else None
+        return await run_ask_decision(self.ctx, args, screenshot)
 
     async def _ask_explorer(
         self, query: str, context_feedback: str | None, state: Any

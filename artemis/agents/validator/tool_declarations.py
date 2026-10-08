@@ -39,6 +39,7 @@ from artemis.core.tool_declaration import ToolDeclaration
 from artemis.mcp.action_specs import tool_declaration
 from artemis.mcp.observation import observe
 from artemis.graph.state import State
+from artemis.tools.decision_tool import ASK_DECISION_DESCRIPTION, ASK_DECISION_TOOL_NAME
 from artemis.utils.notes import (
     LIST_NOTES_DOCSTRING,
     READ_NOTE_ARG_KEY_DESC,
@@ -316,6 +317,73 @@ ASK_EXPLORER_TOOL = ToolDeclaration(
             },
         },
         "required": ["query"],
+    },
+)
+
+# Same contract as the Operator's LangChain tool (artemis/tools/decision_tool.py):
+# the decision layer is opt-in, so the runner declares this only while
+# ask_decision_available(ctx) holds (decision_model.enabled + use.agent_tool).
+ASK_DECISION_TOOL = ToolDeclaration(
+    name=ASK_DECISION_TOOL_NAME,
+    description=ASK_DECISION_DESCRIPTION,
+    parameters={
+        "type": "object",
+        "properties": {
+            "context": {
+                "type": "string",
+                "description": (
+                    "Background for the decision: the scene on screen, what you"
+                    " just did, and what you are trying to decide."
+                ),
+            },
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": (
+                                "Stable answer key, e.g. 'is_settlement'"
+                                " ([A-Za-z0-9_.-], 1-64 chars, unique)."
+                            ),
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": ["bool", "choice", "score"],
+                            "description": "The question type.",
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "The question in plain language.",
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 2,
+                            "maxItems": 6,
+                            "description": "choice only: the mutually exclusive options.",
+                        },
+                        "low": {
+                            "type": "integer",
+                            "description": "score only: scale lower bound (default 1).",
+                        },
+                        "high": {
+                            "type": "integer",
+                            "description": "score only: scale upper bound (default 5, max 20).",
+                        },
+                    },
+                    "required": ["id", "type", "question"],
+                },
+            },
+            "include_screenshot": {
+                "type": "boolean",
+                "description": "Attach the current screenshot to the decision (default true).",
+            },
+        },
+        "required": ["context", "questions"],
     },
 )
 
