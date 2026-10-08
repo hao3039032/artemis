@@ -486,7 +486,12 @@ class DecisionClient:
             ),
         }
         if images:
-            body["images"] = normalize_images(images)
+            encoded = normalize_images(images)
+            if self.config.provider == "cloudflare":
+                # Workers AI requires embedded base64 data URIs, not bare base64
+                # ("image must be an embedded base64 data URI", HTTP 422/5012).
+                encoded = [f"data:image/jpeg;base64,{b64}" for b64 in encoded]
+            body["images"] = encoded
         return body
 
     async def decide(

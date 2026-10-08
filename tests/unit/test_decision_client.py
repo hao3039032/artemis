@@ -578,3 +578,52 @@ def test_cloudflare_score_question_maps_numeric_scale(monkeypatch):
         {"quality": spec}, {"answers": {"quality": {"score": 4}}}
     )
     assert answers_jev["quality"].score == pytest.approx(4.0)
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_images_are_data_uris(monkeypatch):
+    """Workers AI rejects bare base64 in images[] with 422/5012
+    ("image must be an embedded base64 data URI"); the cloudflare provider
+    must wrap each normalized image as a data URI. The custom (Jev) provider
+    keeps bare base64."""
+    from pydantic import SecretStr
+
+    from artemis.config import settings as artemis_settings
+
+    monkeypatch.setattr(artemis_settings, "CLOUDFLARE_ACCOUNT_ID", "acct123", raising=False)
+    monkeypatch.setattr(
+        artemis_settings, "CLOUDFLARE_AUTH_TOKEN", SecretStr("tok"), raising=False
+    )
+    responses = [
+        httpx.Response(
+            200, json={"answers": {"is_present": {"p": 0.9}, "situation": {"choice": "unchanged"}}}
+        ),
+        httpx.Response(
+            200, json={"answers": {"is_present": {"p": 0.9}, "situation": {"choice": "unchanged"}}}
+        ),
+    ]
+    handler, requests = _handler(responses)
+
+    cf = _cloudflare_client()
+    cf._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    jev = _custom_client()
+    jev._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await cf.decide("s", _QUESTIONS, images=[_tiny_jpeg()], decision_point="t")
+        await jev.decide("s", _QUESTIONS, images=[_tiny_jpeg()], decision_point="t")
+    finally:
+        await cf._http.aclose()
+        await jev._http.aclose()
+
+    import base64
+    import json
+
+    cf_payload = json.loads(requests[0].read())
+    jev_payload = json.loads(requests[1].read())
+    assert cf_payload["images"][0].startswith("data:image/jpeg;base64,")
+    # The payload decodes back to the (re-encoded) JPEG bytes.
+    decoded = base64.b64decode(cf_payload["images"][0].split(",", 1)[1])
+    assert decoded.startswith(b"\xff\xd8")
+    # The custom/Jev provider keeps the bare base64 shape.
+    assert not jev_payload["images"][0].startswith("data:")
+    assert base64.b64decode(jev_payload["images"][0]).startswith(b"\xff\xd8")
