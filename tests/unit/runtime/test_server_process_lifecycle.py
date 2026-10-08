@@ -134,7 +134,9 @@ def test_server_main_parses_non_default_bind_address(monkeypatch):
 
     server_module.main(["--host", "127.0.0.1", "--port", "9123"])
 
-    run_server.assert_called_once_with(host="127.0.0.1", port=9123)
+    # Fork extension (f2e369f): main() also forwards parent_pid (None when
+    # ARTEMIS_DAEMON_PARENT_PID is unset).
+    run_server.assert_called_once_with(host="127.0.0.1", port=9123, parent_pid=None)
 
 
 def test_request_graceful_shutdown_uses_metadata_token(monkeypatch):

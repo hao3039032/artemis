@@ -37,7 +37,7 @@ from artemis.llm.decision import DecisionError, choice_question, noul_question
 from artemis.services.decision import get_decision_client
 from artemis.services.llm import acomplete_structured
 from artemis.utils import visualization
-from artemis.utils.logger import get_logger
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

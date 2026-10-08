@@ -73,7 +73,11 @@ def test_spawn_daemon(tmp_path):
         cmd = mock_popen.call_args.args[0]
         assert cmd[0] == sys.executable
         assert cmd[1:3] == ["-m", "apps.admin_console.server"]
-        assert cmd[3:] == ["--host", "127.0.0.1", "--port", "9123"]
+        assert cmd[3:5] == ["--host", "127.0.0.1"]
+        assert "--port" in cmd and cmd[cmd.index("--port") + 1] == "9123"
+        # Fork extension (f2e369f): the daemon's lifetime is tied to the
+        # spawning parent via --parent-pid.
+        assert "--parent-pid" in cmd and cmd[cmd.index("--parent-pid") + 1].isdigit()
 
 
 def test_ensure_daemon_running_when_already_active():

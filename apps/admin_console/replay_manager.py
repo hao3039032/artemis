@@ -158,7 +158,7 @@ class ReplayManager:
         from adbutils import AdbClient
 
         try:
-            from artemis.clients.ui_automator_client import UIAutomatorClient
+            from third_party.mobile_use.clients.ui_automator_client import UIAutomatorClient
         except ImportError:
             raise ImportError(
                 "Failed to import UIAutomatorClient. Ensure artemis package is installed in path."
@@ -1170,6 +1170,10 @@ class ReplayManager:
         latest_ui_hierarchy = None
         if pre_image_meta and "ui_tree" in pre_image_meta:
             latest_ui_hierarchy = pre_image_meta["ui_tree"]
+            # Canvas-game sessions record an empty-string hierarchy (no UI
+            # tree); the State schema expects a list or None.
+            if isinstance(latest_ui_hierarchy, str) and not latest_ui_hierarchy.strip():
+                latest_ui_hierarchy = None
 
         structured_decisions = None
         traces_json_path = step_dir / "traces.json"
@@ -1766,7 +1770,8 @@ class ReplayManager:
 
         initial_goal = self.load_session_goal(session_id, step_dir, str(self.db_path))
 
-        ui_hier, decisions, app_info, dev_date = self.extract_state_prepopulation_data(
+        # State has no fields for the app info or device date (extra="forbid").
+        ui_hier, decisions, _app_info, _dev_date = self.extract_state_prepopulation_data(
             step_dir, step_data, pre_image_meta
         )
 
@@ -1776,19 +1781,14 @@ class ReplayManager:
             raise ImportError(f"Failed to import State module: {import_err}")
 
         state = State(
-            messages=[],
             initial_goal=initial_goal,
             latest_screenshot=str(step_dir / "pre.jpg")
             if (step_dir / "pre.jpg").exists()
             else str(step_dir / "post.jpg"),
             operator_raw_data={"width": self.w, "height": self.h},
             current_step_id=step_data["step_id"],
-            complete_subgoals_by_ids=[],
-            validator_messages=[],
-            subagent_calls=step_data.get("subagent_calls", []),
+            subagent_calls=step_data.get("subagent_calls") or [],
             latest_ui_hierarchy=ui_hier,
-            focused_app_info=app_info,
-            device_date=dev_date,
             structured_decisions=decisions,
         )
         return state

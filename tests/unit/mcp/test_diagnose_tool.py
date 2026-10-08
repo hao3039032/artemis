@@ -1152,6 +1152,13 @@ def test_hung_device_probe_still_times_out(temp_trace_env, monkeypatch):
 
 def test_logs_surface_recent_errors_and_last_failed_task(temp_trace_env, monkeypatch):
     monkeypatch.setattr(diagnose.env_utils, "get_project_root", lambda: temp_trace_env)
+    # The scratch dir lives under the writable app dir (fork: 3b77ebe), not
+    # the repo root; point it at the temp env so the fixture log is read.
+    monkeypatch.setattr(
+        diagnose.env_utils,
+        "get_writable_dir",
+        lambda name: str(diagnose.Path(temp_trace_env) / name),
+    )
     scratch = diagnose.Path(temp_trace_env) / "scratch"
     scratch.mkdir()
     (scratch / "mcp_stderr.log").write_text(
